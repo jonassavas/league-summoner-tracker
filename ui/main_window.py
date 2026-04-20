@@ -1,834 +1,137 @@
-# ui/main_window.py
-from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
-    QPushButton, QLabel, QFormLayout, QSizePolicy,
-    QStackedLayout
-)
-from PySide6.QtCore import Qt, QEvent, QTimer, QRect, QSize
-from PySide6.QtGui import QPixmap, QFont
-from api.riot_api import RiotAPI
-from utils.assets import get_emblem_path
-from api.league_client import LeagueClient
-from api.champion_data import ChampionData
+"""
+ui/main_window.py
 
+Thin top-level window.  Owns the QStackedLayout and handles window-state
+events (maximise / fullscreen) and resize propagation.  All actual UI lives in
+the two screen widgets.
+"""
+from PySide6.QtWidgets import QWidget, QStackedLayout
+from PySide6.QtCore import Qt, QEvent, QRect, QTimer
+from PySide6.QtGui import QFont
+
+from ui.screens.search_screen import SearchScreen
+from ui.screens.champ_select_screen import ChampSelectScreen
 
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-
-        # API
-        self.api = RiotAPI()
-        self.rank_data = None
-        self.flex_visible = False
-        self.champ_data = ChampionData()  # builds id->name mapping, caches patch
-
-        # Window settings
         self.setWindowTitle("League Summoner Tracker")
         self.setMinimumWidth(500)
         self.setMinimumHeight(400)
 
-        self.normal_geometry_data = self.saveGeometry()
-        self.normal_geometry_rect = self.geometry()
-        self.was_maximized = False
-        self.is_fullscreen = False
-
-        # --------------------------------------------------
-        # STACKED LAYOUT FOR MULTIPLE SCREENS
-        # --------------------------------------------------
-        self.stack = QStackedLayout()
-        self.setLayout(self.stack)
-
-        # --------------------------------------------------
-        # MAIN SCREEN
-        # --------------------------------------------------
-        self.main_screen = QWidget()
-        main_layout = QVBoxLayout(self.main_screen)
-
-        # Form layout Name/Tag
-        self.name_input = QLineEdit()
-        self.tag_input = QLineEdit()
-        self.name_input.setPlaceholderText("e.g. Jone")
-        self.tag_input.setPlaceholderText("e.g. SWE")
-        form_layout = QFormLayout()
-        form_layout.addRow("Name:", self.name_input)
-        form_layout.addRow("Tag Line #:", self.tag_input)
-        main_layout.addLayout(form_layout)
-
-        # Horizontal content
-        content_layout = QHBoxLayout()
-        self.left_column = QVBoxLayout()
-
-        self.search_btn = QPushButton("Search")
-        self.search_btn.setFixedHeight(40)
-        self.search_btn.clicked.connect(self.on_search)
-        self.toggle_btn = QPushButton("Show Flex Ranking")
-        self.toggle_btn.setFixedHeight(40)
-        self.toggle_btn.clicked.connect(self.toggle_flex)
-        self.toggle_btn.hide()
-        self.champ_btn = QPushButton("Show Champ-Select")
-        self.champ_btn.setFixedHeight(40)
-        self.champ_btn.clicked.connect(self.on_show_champ)
-        self.summoner_label = QLabel("")
-        self.summoner_label.setAlignment(Qt.AlignCenter)
-        self.summoner_label.setWordWrap(True)
-
-        self.left_column.addWidget(self.search_btn)
-        self.left_column.addWidget(self.toggle_btn)
-        self.left_column.addWidget(self.champ_btn)
-        self.left_column.addStretch()
-        self.left_column.addWidget(self.summoner_label)
-        content_layout.addLayout(self.left_column, 1)
-
-        # Right column for rank info
-        self.rank_layout = QHBoxLayout()
-        # Solo/Duo
-        self.solo_container = QWidget()
-        self.solo_vbox = QVBoxLayout(self.solo_container)
-        self.solo_label_title = QLabel("Solo/Duo")
-        self.solo_label_title.setAlignment(Qt.AlignCenter)
-        self.solo_emblem = QLabel()
-        self.solo_emblem.setAlignment(Qt.AlignCenter)
-        self.solo_emblem.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
-        self.solo_emblem.setMinimumSize(1, 1)
-        self.solo_emblem.installEventFilter(self)
-        self.solo_text = QLabel("")
-        self.solo_text.setAlignment(Qt.AlignCenter)
-        self.solo_text.setWordWrap(True)
-        self.solo_vbox.addWidget(self.solo_label_title)
-        self.solo_vbox.addWidget(self.solo_emblem, 1)
-        self.solo_vbox.addWidget(self.solo_text)
-        self.solo_container.hide()
-
-        # Flex
-        self.flex_container = QWidget()
-        self.flex_vbox = QVBoxLayout(self.flex_container)
-        self.flex_label_title = QLabel("Flex")
-        self.flex_label_title.setAlignment(Qt.AlignCenter)
-        self.flex_emblem = QLabel()
-        self.flex_emblem.setAlignment(Qt.AlignCenter)
-        self.flex_emblem.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
-        self.flex_emblem.setMinimumSize(1, 1)
-        self.flex_emblem.installEventFilter(self)
-        self.flex_text = QLabel("")
-        self.flex_text.setAlignment(Qt.AlignCenter)
-        self.flex_text.setWordWrap(True)
-        self.flex_vbox.addWidget(self.flex_label_title)
-        self.flex_vbox.addWidget(self.flex_emblem, 1)
-        self.flex_vbox.addWidget(self.flex_text)
-        self.flex_container.hide()
-
-        self.rank_layout.addWidget(self.solo_container, 1)
-        self.rank_layout.addWidget(self.flex_container, 1)
-        content_layout.addLayout(self.rank_layout, 4)
-        main_layout.addLayout(content_layout)
-
-        # Font scaling
-        self.base_font = QFont()
-        self.base_font.setPointSize(12)
-        for widget in [self.solo_text, self.flex_text, self.solo_label_title, self.flex_label_title, self.summoner_label]:
-            widget.setFont(self.base_font)
-
-        self.solo_original_pixmap = None
-        self.flex_original_pixmap = None
-
-        self.stack.addWidget(self.main_screen)
-
-        # --------------------------------------------------
-        # CHAMP SELECT SCREEN
-        # --------------------------------------------------
-        self.champ_screen = QWidget()
-        self.champ_layout = QVBoxLayout(self.champ_screen)  # Only assign once!
-
-        # Back button
-        self.back_btn = QPushButton("← Back")
-        self.back_btn.clicked.connect(self.go_back)
-
-        # Info label
-        self.champ_select_label = QLabel("Champion select will appear here.")
-        self.champ_select_label.setAlignment(Qt.AlignCenter)
-        self.champ_select_label.setWordWrap(True)
-
-        # Top container: back button + info label
-        top_container = QVBoxLayout()
-        top_container.addWidget(self.back_btn)
-        top_container.addWidget(self.champ_select_label)
-        self.champ_layout.addLayout(top_container)
-
-        # Bans container
-        self.bans_container = QWidget()
-        self.bans_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.bans_layout = QHBoxLayout(self.bans_container)
-        self.bans_layout.setContentsMargins(10, 10, 10, 10)
-        self.bans_layout.setSpacing(10)
-
-        # Blue bans
-        self.my_ban_labels = [QLabel() for _ in range(5)]
-        self.blue_ban_layout = QHBoxLayout()
-        self.blue_ban_layout.setSpacing(4)
-        self.blue_ban_layout.setAlignment(Qt.AlignLeft)
-        for lbl in self.my_ban_labels:
-            lbl.setFixedSize(48, 48)
-            lbl.setStyleSheet("border:2px solid gray; background-color: #ddeeff;")
-            self.blue_ban_layout.addWidget(lbl)
-        self.bans_layout.addLayout(self.blue_ban_layout)
-
-        self.bans_layout.addStretch()
-
-        # Red bans
-        self.enemy_ban_labels = [QLabel() for _ in range(5)]
-        self.red_ban_layout = QHBoxLayout()
-        self.red_ban_layout.setSpacing(4)
-        self.red_ban_layout.setAlignment(Qt.AlignRight)
-        for lbl in self.enemy_ban_labels:
-            lbl.setFixedSize(48, 48)
-            lbl.setStyleSheet("border:2px solid gray; background-color: #ffdddd;")
-            self.red_ban_layout.addWidget(lbl)
-        self.bans_layout.addLayout(self.red_ban_layout)
-
-        self.champ_layout.addWidget(self.bans_container)
-        self.bans_container.hide()
-
-        # Picks container
-        self.picks_container = QWidget()
-        self.picks_layout = QHBoxLayout(self.picks_container)
-
-        # Blue picks
-        # BLUE TEAM PICK STRUCTURE (Champion + Spells)
-        self.my_team_champ_labels = []
-        self.my_team_spell1_labels = []
-        self.my_team_spell2_labels = []
-
-        self.blue_team_layout = QVBoxLayout()
-
-        for _ in range(5):
-            row = QHBoxLayout()
-            row.setSpacing(4)
-
-            # Champion icon
-            champ_lbl = QLabel()
-            champ_lbl.setFixedSize(64, 64)
-            champ_lbl.setStyleSheet("border:2px solid gray; background-color: #ddeeff;")
-            self.my_team_champ_labels.append(champ_lbl)
-
-            # Spells stacked vertically
-            spell_col = QVBoxLayout()
-            spell_col.setSpacing(2)
-
-            spell1 = QLabel()
-            spell2 = QLabel()
-            for sp in (spell1, spell2):
-                sp.setFixedSize(22, 22)
-                #sp.setStyleSheet("border:1px solid black; background-color: #eeeeee;")
-                # Set empty transparent pixmap to reserve space
-                empty_pix = QPixmap(sp.size())
-                empty_pix.fill(Qt.transparent)
-                sp.setPixmap(empty_pix)
-                sp.show()  # always show so layout doesn't collapse
-
-            self.my_team_spell1_labels.append(spell1)
-            self.my_team_spell2_labels.append(spell2)
-
-            spell_col.addWidget(spell1)
-            spell_col.addWidget(spell2)
-
-            row.addWidget(champ_lbl)
-            row.addLayout(spell_col)   # spells on the RIGHT side of pick
-            
-            self.blue_team_layout.addLayout(row)
-
-
-        self.picks_layout.addLayout(self.blue_team_layout)
-
-        self.picks_layout.addStretch()
-
-        # Red picks
-        self.enemy_team_champ_labels = []
-        self.enemy_team_spell1_labels = []
-        self.enemy_team_spell2_labels = []
-
-        self.red_team_layout = QVBoxLayout()
-
-        for _ in range(5):
-            row = QHBoxLayout()
-            row.setSpacing(4)
-
-            # Spells first (on LEFT)
-            spell_col = QVBoxLayout()
-            spell_col.setSpacing(2)
-
-            spell1 = QLabel()
-            spell2 = QLabel()
-            for sp in (spell1, spell2):
-                sp.setFixedSize(22, 22)
-                #sp.setStyleSheet("border:1px solid black; background-color: #eeeeee;")
-                # Set empty transparent pixmap to reserve space
-                empty_pix = QPixmap(sp.size())
-                empty_pix.fill(Qt.transparent)
-                sp.setPixmap(empty_pix)
-                sp.show()  # always show so layout doesn't collapse
-
-            self.enemy_team_spell1_labels.append(spell1)
-            self.enemy_team_spell2_labels.append(spell2)
-
-            spell_col.addWidget(spell1)
-            spell_col.addWidget(spell2)
-
-            # Champion icon
-            champ_lbl = QLabel()
-            champ_lbl.setFixedSize(64, 64)
-            champ_lbl.setStyleSheet("border:2px solid gray; background-color: #ffdddd;")
-            self.enemy_team_champ_labels.append(champ_lbl)
-
-            row.addLayout(spell_col)
-            row.addWidget(champ_lbl)
-
-            self.red_team_layout.addLayout(row)
-
-
-        self.picks_layout.addLayout(self.red_team_layout)
-
-        # Store original QPixmaps for champion picks and bans
-        self.pick_original_pixmaps = {}  # key = QLabel, value = QPixmap
-        self.ban_original_pixmaps = {}   # key = QLabel, value = QPixmap
-
-        # Add spacing between picks
-        self.blue_team_layout.setSpacing(5)
-        self.red_team_layout.setSpacing(5)
-
-
-
-        self.champ_layout.addWidget(self.picks_container, alignment=Qt.AlignTop)
-        self.picks_container.hide()
-
-        # Timer for champ select updates
-        self.champ_timer = QTimer(self)
-        self.champ_timer.setInterval(1000)
-        self.champ_timer.timeout.connect(self.update_champ_select)
-
-        # ADD TO STACKED LAYOUT (fixes the screen not showing)
-        self.stack.addWidget(self.champ_screen)
-
-
-
-    # --------------------------------------------------
-    # Search button logic
-    # --------------------------------------------------
-    def on_search(self):
-        name = self.name_input.text().strip()
-        tag = self.tag_input.text().strip()
-        self.flex_visible = False
-        self.solo_container.hide()
-        self.flex_container.hide()
-        self.toggle_btn.hide()
-
-        if not name or not tag:
-            self.solo_container.show()
-            self.solo_text.setText("Please enter both Name and Tag line")
-            self.summoner_label.setText("")
-            self.solo_emblem.clear()
-            self.flex_emblem.clear()
-            self.solo_original_pixmap = None
-            self.flex_original_pixmap = None
-            return
-
-        self.summoner_label.setText(f"{name}\n#{tag}")
-
-        status, puuid_or_error = self.api.get_puuid(name, tag)
-        if status != 200:
-            self.solo_container.show()
-            self.solo_text.setText(f"Error getting PUUID:\n{puuid_or_error}")
-            return
-        puuid = puuid_or_error
-
-        status, ranked = self.api.get_ranked_data(puuid)
-        if status != 200:
-            self.solo_container.show()
-            self.solo_text.setText(f"Error getting ranked data:\n{ranked}")
-            return
-        self.rank_data = ranked
-
-        # Solo rank
-        solo = ranked.get("solo")
-        if solo:
-            self.solo_container.show()
-            tier = solo["tier"]
-            emblem_path = get_emblem_path(tier)
-            self.solo_original_pixmap = QPixmap(emblem_path)
-            self.solo_emblem.clear()
-            QTimer.singleShot(0, self.scale_emblems)
-            self.solo_text.setText(
-                f"{tier.title()} {solo['rank']} - {solo['leaguePoints']} LP\n"
-                f"Wins: {solo['wins']}  Losses: {solo['losses']}"
-            )
-        else:
-            self.solo_container.show()
-            self.solo_emblem.clear()
-            self.solo_original_pixmap = None
-            self.solo_text.setText("Solo/Duo\nUnranked")
-
-        # Flex rank
-        flex = ranked.get("flex")
-        if flex:
-            self.flex_container.show()
-            tier = flex["tier"]
-            emblem_path = get_emblem_path(tier)
-            self.flex_original_pixmap = QPixmap(emblem_path)
-            self.flex_emblem.clear()
-            QTimer.singleShot(0, self.scale_emblems)
-            self.flex_text.setText(
-                f"{tier.title()} {flex['rank']} - {flex['leaguePoints']} LP\n"
-                f"Wins: {flex['wins']}  Losses: {flex['losses']}"
-            )
-            self.flex_container.hide()
-            self.toggle_btn.show()
-        else:
-            self.flex_container.hide()
-            self.flex_emblem.clear()
-            self.flex_original_pixmap = None
-            self.flex_text.setText("Flex\nUnranked")
-            self.toggle_btn.hide()
-
-    # --------------------------------------------------
-    # Toggle flex
-    # --------------------------------------------------
-    def toggle_flex(self):
-        if self.flex_visible:
-            self.flex_container.hide()
-            self.toggle_btn.setText("Show Flex Ranking")
-            self.flex_visible = False
-        else:
-            self.flex_container.show()
-            self.toggle_btn.setText("Hide Flex Ranking")
-            self.flex_visible = True
-            QTimer.singleShot(0, self.scale_emblems)
-
-    # --------------------------------------------------
-    # Champ Select Screen
-    # --------------------------------------------------
-    def on_show_champ(self):
-        self.stack.setCurrentIndex(1)
-        self.champ_timer.start()
-        self.update_champ_select()
-        QTimer.singleShot(0, self.update_box_sizes)
-
-
-    def go_back(self):
-        self.champ_timer.stop()
-        self.reset_champ_select_styles()
-        self.stack.setCurrentIndex(0)
-
-    def update_champ_select(self):
-        client = LeagueClient()
-        status, data = client.get_champ_select()
-
-        # Reset all boxes first
-        for lbl in (
-            self.my_team_champ_labels +
-            self.enemy_team_champ_labels +
-            self.my_ban_labels +
-            self.enemy_ban_labels +
-            self.my_team_spell1_labels +
-            self.my_team_spell2_labels +
-            self.enemy_team_spell1_labels +
-            self.enemy_team_spell2_labels
-        ):
-            lbl.clear()
-
-
-        if status != 200 or not data:
-            # No champ select
-            self.champ_select_label.setText("Not in champ select.")
-            self.champ_select_label.show()
-            self.bans_container.hide()
-            self.picks_container.hide()
-
-            # NEW: fully reset pick/ban icons + styles
-            self.reset_champ_select_styles()
-
-            for lbl in (
-                self.my_team_champ_labels +
-                self.enemy_team_champ_labels +
-                self.my_ban_labels +
-                self.enemy_ban_labels +
-                self.my_team_spell1_labels +
-                self.my_team_spell2_labels +
-                self.enemy_team_spell1_labels +
-                self.enemy_team_spell2_labels
-            ):
-                lbl.clear()
-
-
-            return
-
-
-        # Champ select active
-        self.champ_select_label.hide()
-        self.bans_container.show()
-        self.picks_container.show()
-        QTimer.singleShot(0, self.update_box_sizes)
-
-
-        # Determine blue/red side
-        blue_team = []
-        red_team = []
-        for champ in data.get("myTeam", []) + data.get("theirTeam", []):
-            if champ.get("team") == 1:
-                blue_team.append(champ)
-            else:
-                red_team.append(champ)
-
-        # Blue team picks
-        for i, champ in enumerate(blue_team):
-            if i >= 5:
-                continue
-            icon_path = self.champ_data.get_champion_icon(champ.get("championId"))
-            if icon_path:
-                pix = QPixmap(icon_path)
-                lbl = self.my_team_champ_labels[i]   # FIXED
-                self.pick_original_pixmaps[lbl] = pix
-                self.scale_pixmap_to_label(lbl)
-                lbl.setStyleSheet("border:2px solid #0000ff; background-color: #ddeeff;")
-
-
-        
-        # BLUE TEAM SPELLS
-        for i, champ in enumerate(blue_team):
-            if i >= 5:
-                continue
-
-            spell1 = champ.get("spell1Id")
-            spell2 = champ.get("spell2Id")
-
-            self.update_spell_label(self.my_team_spell1_labels[i], spell1)
-            self.update_spell_label(self.my_team_spell2_labels[i], spell2)
-
-
-
-        # Red team picks
-        for i, champ in enumerate(red_team):
-            if i >= 5:
-                continue
-            icon_path = self.champ_data.get_champion_icon(champ.get("championId"))
-            if icon_path:
-                pix = QPixmap(icon_path)
-                lbl = self.enemy_team_champ_labels[i]  # FIXED
-                self.pick_original_pixmaps[lbl] = pix
-                self.scale_pixmap_to_label(lbl)
-                lbl.setStyleSheet("border:2px solid #ff0000; background-color: #ffdddd;")
-
-        
-        # RED TEAM SPELLS
-        for i, champ in enumerate(red_team):
-            if i >= 5:
-                continue
-
-            spell1 = champ.get("spell1Id")
-            spell2 = champ.get("spell2Id")
-
-            self.update_spell_label(self.enemy_team_spell1_labels[i], spell1)
-            self.update_spell_label(self.enemy_team_spell2_labels[i], spell2)
-
-
-
-
-        # Update bans properly
-        blue_ban_index = 0
-        red_ban_index = 4
-
-        for group in data.get("actions", []):
-            for action in group:
-                if action.get("type") != "ban" or not action.get("completed"):
-                    continue
-                champ_id = action.get("championId")
-                icon_path = self.champ_data.get_champion_icon(champ_id)
-                if not icon_path:
-                    continue
-                pix = QPixmap(icon_path)  # store original
-
-                team_side = 1 if action.get("isAllyAction") else 2
-                if team_side == 1 and blue_ban_index < 5:  # Blue side bans
-                    lbl = self.my_ban_labels[blue_ban_index]
-                    self.ban_original_pixmaps[lbl] = pix
-                    self.scale_pixmap_to_label(lbl)
-                    lbl.setStyleSheet("border:2px solid #0000ff; background-color: #ddeeff;")
-                    blue_ban_index += 1
-                elif team_side == 2 and red_ban_index >= 0:  # Red side bans
-                    lbl = self.enemy_ban_labels[red_ban_index]
-                    self.ban_original_pixmaps[lbl] = pix
-                    self.scale_pixmap_to_label(lbl)
-                    lbl.setStyleSheet("border:2px solid #ff0000; background-color: #ffdddd;")
-                    red_ban_index -= 1
-
-    def update_spell_label(self, label, spell_id):
-        """Show/hide a spell icon without collapsing the layout."""
-        if not spell_id or spell_id == 0:
-            # Use a transparent pixmap to keep layout space
-            empty_pix = QPixmap(label.size())
-            empty_pix.fill(Qt.transparent)
-            label.setPixmap(empty_pix)
-            label.show()
-            return
-
-        icon_path = self.champ_data.get_spell_icon(spell_id)
-        if not icon_path:
-            # If icon not found, also fill with transparent
-            empty_pix = QPixmap(label.size())
-            empty_pix.fill(Qt.transparent)
-            label.setPixmap(empty_pix)
-            label.show()
-            return
-
-        pix = QPixmap(icon_path).scaled(
-            label.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
+        # Track geometry for restoring after maximise/fullscreen
+        self._normal_geometry_data = self.saveGeometry()
+        self._normal_geometry_rect = self.geometry()
+        self._was_maximized  = False
+        self._is_fullscreen  = False
+
+        # ------------------------------------------------------------------
+        # Stacked layout: index 0 = search, index 1 = champ select
+        # ------------------------------------------------------------------
+        self._stack = QStackedLayout(self)
+
+        self._search_screen = SearchScreen(
+            on_show_champ_select=self._show_champ_select
         )
-        label.setPixmap(pix)
-        label.show()
+        self._champ_screen = ChampSelectScreen(
+            on_back=self._show_search
+        )
 
+        self._stack.addWidget(self._search_screen)   # index 0
+        self._stack.addWidget(self._champ_screen)    # index 1
 
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
 
+    def _show_champ_select(self):
+        self._stack.setCurrentIndex(1)
+        self._champ_screen.start()
 
+    def _show_search(self):
+        self._stack.setCurrentIndex(0)
 
-    # --------------------------------------------------
-    # Scaling + Events
-    # --------------------------------------------------
+    # ------------------------------------------------------------------
+    # Window state events (maximise / fullscreen handling)
+    # ------------------------------------------------------------------
+
     def changeEvent(self, event):
         if event.type() == QEvent.WindowStateChange:
-            now_maximized = bool(self.windowState() & Qt.WindowMaximized)
-            if now_maximized:
-                self.was_maximized = True
+            maximized = bool(self.windowState() & Qt.WindowMaximized)
+            if maximized:
+                self._was_maximized = True
             else:
-                if self.was_maximized:
+                if self._was_maximized:
                     try:
                         self.showNormal()
                     except Exception:
                         pass
-                    QTimer.singleShot(50, self._apply_saved_normal_geometry_and_scale)
-                self.was_maximized = False
+                    QTimer.singleShot(50, self._restore_normal_geometry)
+                self._was_maximized = False
 
             if self.windowState() & Qt.WindowFullScreen:
-                self.is_fullscreen = True
+                self._is_fullscreen = True
             else:
-                if self.is_fullscreen:
+                if self._is_fullscreen:
                     try:
-                        self.restoreGeometry(self.normal_geometry_data)
+                        self.restoreGeometry(self._normal_geometry_data)
                     except Exception:
                         pass
-                    self.is_fullscreen = False
+                    self._is_fullscreen = False
 
         super().changeEvent(event)
 
-    def _apply_saved_normal_geometry_and_scale(self):
+    def _restore_normal_geometry(self):
         try:
-            screen = self.screen()
+            screen   = self.screen()
             scr_geom = screen.availableGeometry() if screen else None
         except Exception:
             scr_geom = None
 
         use_rect = None
-        if isinstance(self.normal_geometry_rect, QRect) and not self.normal_geometry_rect.isNull():
+        if isinstance(self._normal_geometry_rect, QRect) and \
+                not self._normal_geometry_rect.isNull():
             if scr_geom:
-                if (self.normal_geometry_rect.width() >= scr_geom.width() * 0.9 or
-                        self.normal_geometry_rect.height() >= scr_geom.height() * 0.9):
-                    use_rect = None
-                else:
-                    use_rect = self.normal_geometry_rect
-            else:
-                use_rect = self.normal_geometry_rect
+                too_wide = self._normal_geometry_rect.width()  >= scr_geom.width()  * 0.9
+                too_tall = self._normal_geometry_rect.height() >= scr_geom.height() * 0.9
+                if not too_wide and not too_tall:
+                    use_rect = self._normal_geometry_rect
 
         if use_rect is None:
-            fallback_w, fallback_h = 800, 600
+            fw, fh = 800, 600
             if scr_geom:
-                cx = scr_geom.x() + (scr_geom.width() - fallback_w) // 2
-                cy = scr_geom.y() + (scr_geom.height() - fallback_h) // 2
-                use_rect = QRect(cx, cy, fallback_w, fallback_h)
+                cx = scr_geom.x() + (scr_geom.width()  - fw) // 2
+                cy = scr_geom.y() + (scr_geom.height() - fh) // 2
+                use_rect = QRect(cx, cy, fw, fh)
             else:
-                use_rect = QRect(100, 100, fallback_w, fallback_h)
+                use_rect = QRect(100, 100, fw, fh)
 
         try:
             self.setGeometry(use_rect)
         except Exception:
             try:
-                self.restoreGeometry(self.normal_geometry_data)
+                self.restoreGeometry(self._normal_geometry_data)
             except Exception:
                 pass
 
-        QTimer.singleShot(0, self.scale_emblems)
+        QTimer.singleShot(0, self._search_screen.scale_emblems)
+
+    # ------------------------------------------------------------------
+    # Resize propagation
+    # ------------------------------------------------------------------
 
     def resizeEvent(self, event):
-        # Track normal geometry when not maximized/fullscreen
-        if not (self.windowState() & Qt.WindowMaximized) and not (self.windowState() & Qt.WindowFullScreen):
+        if not (self.windowState() & Qt.WindowMaximized) and \
+                not (self.windowState() & Qt.WindowFullScreen):
             try:
-                self.normal_geometry_rect = self.geometry()
-                self.normal_geometry_data = self.saveGeometry()
+                self._normal_geometry_rect = self.geometry()
+                self._normal_geometry_data = self.saveGeometry()
             except Exception:
                 pass
 
-        # Scale fonts
-        self.scale_fonts()
-        
-        # Scale emblems (solo/flex)
-        QTimer.singleShot(0, self.scale_emblems)
-        
-        # Dynamically scale champion picks and bans
-        QTimer.singleShot(0, self.update_box_sizes)
-        
+        self._search_screen.scale_fonts(self.width())
+        QTimer.singleShot(0, self._search_screen.scale_emblems)
+        QTimer.singleShot(0, self._champ_screen.rescale)
+
         super().resizeEvent(event)
-
-
-    def eventFilter(self, obj, event):
-        if event.type() == QEvent.Resize:
-            if obj == self.solo_emblem or obj == self.flex_emblem:
-                QTimer.singleShot(0, self.scale_emblems)
-        return super().eventFilter(obj, event)
-
-    def scale_fonts(self):
-        font_size = max(12, self.width() // 35)
-        font = QFont(self.base_font)
-        font.setPointSize(font_size)
-        self.solo_text.setFont(font)
-        self.flex_text.setFont(font)
-        self.solo_label_title.setFont(font)
-        self.flex_label_title.setFont(font)
-        self.summoner_label.setFont(font)
-
-    def scale_emblems(self):
-        if self.solo_original_pixmap:
-            lw, lh = self.solo_emblem.width(), self.solo_emblem.height()
-            if lw > 1 and lh > 1:
-                scaled = self.solo_original_pixmap.scaled(
-                    QSize(lw, lh), Qt.KeepAspectRatio, Qt.SmoothTransformation
-                )
-                self.solo_emblem.setPixmap(scaled)
-
-        if self.flex_original_pixmap:
-            lw, lh = self.flex_emblem.width(), self.flex_emblem.height()  # <-- fix here
-            if lw > 1 and lh > 1:
-                scaled = self.flex_original_pixmap.scaled(
-                    QSize(lw, lh), Qt.KeepAspectRatio, Qt.SmoothTransformation
-                )
-                self.flex_emblem.setPixmap(scaled)
-
-
-    def update_box_sizes(self):
-        if not self.champ_screen.isVisible():
-            return
-
-        # Original fixed sizes (you can tweak these if you want smaller boxes)
-        pick_orig_w, pick_orig_h = 42, 42
-        ban_orig_w, ban_orig_h = 32, 32
-
-        # Current available size
-        total_width = self.champ_screen.width()
-        total_height = self.champ_screen.height()
-
-        # Reserve space for back button + info label + some buffer (~120px)
-        reserved_height = 120
-        available_height = max(total_height - reserved_height, 1)
-        available_width = max(total_width - 40, 1)  # some horizontal padding
-
-        # Picks: 5 rows vertically, 2 columns (blue/red)
-        pick_rows = 5
-        pick_cols = 2
-
-        # Estimate spacing between boxes (10% of original pick height)
-        max_spacing = int(pick_orig_h * 0.1)
-        total_spacing = (pick_rows - 1) * max_spacing
-
-        # Max vertical scale including spacing
-        pick_scale_v = (available_height - total_spacing) / (pick_orig_h * pick_rows)
-        # Max horizontal scale
-        pick_scale_h = available_width / (pick_orig_w * pick_cols)
-
-        # Use the smaller of width or height scaling to maintain aspect ratio
-        pick_scale = min(pick_scale_v, pick_scale_h)
-
-        # Compute pick size
-        pick_size = QSize(int(pick_orig_w * pick_scale), int(pick_orig_h * pick_scale))
-
-        # Compute spacing dynamically (min 5px)
-        spacing = max(5, int(pick_size.height() * 0.1))
-        self.blue_team_layout.setSpacing(spacing)
-        self.red_team_layout.setSpacing(spacing)
-
-        # Apply pick sizes
-        for lbl in self.my_team_champ_labels + self.enemy_team_champ_labels:
-            lbl.setFixedSize(pick_size)
-
-            self.scale_pixmap_to_label(lbl)
-
-        # Ban size ~ 75% of pick size
-        ban_size = QSize(int(ban_orig_w * pick_scale * 0.75), int(ban_orig_h * pick_scale * 0.75))
-        for lbl in self.my_ban_labels + self.enemy_ban_labels:
-            lbl.setFixedSize(ban_size)
-            self.scale_pixmap_to_label(lbl)
-
-        # Set top/bottom margins for picks and bans
-        self.picks_layout.setContentsMargins(0, spacing, 0, spacing)
-        self.bans_layout.setContentsMargins(10, spacing, 10, spacing)
-
-        # Spell size: ~30% of pick box
-        spell_size = QSize(
-            int(pick_size.height() * 0.40),
-            int(pick_size.height() * 0.40)
-        )
-
-
-        for lbl in self.my_team_spell1_labels + self.my_team_spell2_labels + \
-                self.enemy_team_spell1_labels + self.enemy_team_spell2_labels:
-            lbl.setFixedSize(spell_size)
-            self.scale_pixmap_to_label(lbl)
-
-
-
-
-
-
-
-
-
-    def scale_pixmap_to_label(self, lbl):
-        # Picks
-        if lbl in self.pick_original_pixmaps:
-            pixmap = self.pick_original_pixmaps[lbl]
-        # Bans
-        elif lbl in self.ban_original_pixmaps:
-            pixmap = self.ban_original_pixmaps[lbl]
-        else:
-            pixmap = lbl.pixmap()
-
-        if pixmap:
-            scaled = pixmap.scaled(
-                lbl.width(), lbl.height(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            lbl.setPixmap(scaled)
-
-
-    def reset_champ_select_styles(self):
-        default_pick_blue = "border:2px solid gray; background-color: #ddeeff;"
-        default_pick_red  = "border:2px solid gray; background-color: #ffdddd;"
-
-        default_ban_blue = "border:2px solid gray; background-color: #ddeeff;"
-        default_ban_red  = "border:2px solid gray; background-color: #ffdddd;"
-
-        # Reset picks
-        for lbl in self.my_team_champ_labels:
-            lbl.setStyleSheet(default_pick_blue)
-
-        for lbl in self.enemy_team_champ_labels:
-            lbl.setStyleSheet(default_pick_red)
-
-        # Reset bans
-        for lbl in self.my_ban_labels:
-            lbl.setStyleSheet(default_ban_blue)
-
-        for lbl in self.enemy_ban_labels:
-            lbl.setStyleSheet(default_ban_red)
-
-        # Clear pixmap caches
-        self.pick_original_pixmaps.clear()
-        self.ban_original_pixmaps.clear()
